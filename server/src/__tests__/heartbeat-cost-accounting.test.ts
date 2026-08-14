@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   resolveCacheAdjustedCostUsd,
   resolveLedgerCostStatus,
+  shouldRecordLedgerEvent,
 } from "../services/heartbeat.js";
 
 describe("heartbeat cost accounting", () => {
@@ -63,5 +64,51 @@ describe("heartbeat cost accounting", () => {
       costUsd: 3.1,
       cacheAdjustedCostUsd: 1.5,
     })).toBe(1.5);
+  });
+
+  // A subscription run always bills 0 cents, so the ledger has to key off the
+  // reported dollar figure. Without this, a run that burned quota and then
+  // failed before reporting tokens leaves no ledger row and no owning issue,
+  // and every per-issue total silently understates by that run.
+  it("records a ledger event for a subscription run priced in dollars but billed at zero cents", () => {
+    expect(shouldRecordLedgerEvent({
+      billedCostCents: 0,
+      billedCostUsd: 0.42,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+    })).toBe(true);
+  });
+
+  it("records a ledger event for token usage that carries no reported cost", () => {
+    expect(shouldRecordLedgerEvent({
+      billedCostCents: 0,
+      billedCostUsd: null,
+      inputTokens: 1_200,
+      cachedInputTokens: 0,
+      outputTokens: 40,
+    })).toBe(true);
+  });
+
+  it("records a ledger event for metered spend", () => {
+    expect(shouldRecordLedgerEvent({
+      billedCostCents: 125,
+      billedCostUsd: 1.25,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+    })).toBe(true);
+  });
+
+  // A run that reported nothing at all is still not invented into the ledger:
+  // `summary.unmeteredRunCount` reports it as a known gap instead.
+  it("does not record a ledger event for a run that reported neither cost nor tokens", () => {
+    expect(shouldRecordLedgerEvent({
+      billedCostCents: 0,
+      billedCostUsd: null,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+    })).toBe(false);
   });
 });

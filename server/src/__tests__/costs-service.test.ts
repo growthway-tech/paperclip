@@ -14,6 +14,8 @@ import {
   heartbeatRuns,
   issues,
   projects,
+  routines,
+  routineRuns,
 } from "@paperclipai/db";
 import { costService } from "../services/costs.ts";
 import { financeService } from "../services/finance.ts";
@@ -420,6 +422,8 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     await db.delete(financeEvents);
     await db.delete(costEvents);
     await db.delete(activityLog);
+    await db.delete(routineRuns);
+    await db.delete(routines);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(projects);
@@ -932,5 +936,304 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(summary.estimatedDebitCents).toBe(2_000_000_000);
     expect(byKindRow?.debitCents).toBe(4_000_000_000);
     expect(byKindRow?.netCents).toBe(4_000_000_000);
+  });
+
+  /**
+   * The scenario that made per-task numbers untrustworthy: one run touches many
+   * issues, and `GET /issues/{id}/runs` hands the full usage to each of them.
+   * Summing that way inflated the company total by 87%. These tests assert the
+   * property that failure violates — per-issue rows must sum to the company
+   * total, not to a multiple of it.
+   */
+  it("attributes a multi-issue run to one owner so per-issue tokens sum to the company total", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const ownerIssueId = randomUUID();
+    const touchedIssueId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Cost Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: ownerIssueId,
+        companyId,
+        title: "Owner",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 1,
+        identifier: "TST-1",
+      },
+      {
+        id: touchedIssueId,
+        companyId,
+        title: "Merely touched",
+        status: "done",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: "TST-2",
+      },
+    ]);
+
+    // One run, owned by TST-1, that also wrote to TST-2. The activity_log rows
+    // are what make the run *appear* under both issues.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      status: "succeeded",
+      startedAt: new Date("2026-04-10T00:00:00.000Z"),
+      finishedAt: new Date("2026-04-10T00:10:00.000Z"),
+      contextSnapshot: { issueId: ownerIssueId },
+      usageJson: { costUsd: 3.5, billingType: "subscription_included" },
+    });
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: ownerIssueId,
+        runId,
+      },
+      {
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        action: "issue.commented",
+        entityType: "issue",
+        entityId: touchedIssueId,
+        runId,
+      },
+    ]);
+
+    // Subscription usage: real tokens, zero billed cents. Exactly the shape
+    // that made the cost panel read $0 while the account burned its quota.
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      issueId: ownerIssueId,
+      heartbeatRunId: runId,
+      provider: "anthropic",
+      biller: "claude",
+      billingType: "subscription_included",
+      costStatus: "unpriced",
+      model: "claude-opus-5",
+      inputTokens: 1_000,
+      cachedInputTokens: 10_000,
+      outputTokens: 100,
+      costCents: 0,
+      occurredAt: new Date("2026-04-10T00:10:00.000Z"),
+    });
+
+    const range = {
+      from: new Date("2026-04-01T00:00:00.000Z"),
+      to: new Date("2026-04-15T23:59:59.999Z"),
+    };
+
+    const byIssue = await costService(db).byIssue(companyId, range);
+    const summary = await costService(db).summary(companyId, range);
+
+    // The run is charged once, to its owner — not to both issues it touched.
+    expect(byIssue).toHaveLength(1);
+    expect(byIssue[0]?.issueIdentifier).toBe("TST-1");
+    expect(byIssue[0]?.totalTokens).toBe(11_100);
+    expect(byIssue[0]?.runCount).toBe(1);
+
+    // The conservation property the acceptance criterion turns on.
+    const summedOverIssues = byIssue.reduce((acc, row) => acc + Number(row.totalTokens), 0);
+    expect(summedOverIssues).toBe(summary.totalTokens);
+
+    // Subscription dollars are visible even though billed cents are zero.
+    expect(summary.spendCents).toBe(0);
+    expect(summary.subscriptionCostUsd).toBeCloseTo(3.5, 5);
+    expect(byIssue[0]?.subscriptionCostUsd).toBeCloseTo(3.5, 5);
+  });
+
+  it("counts runs that recorded no usage instead of silently under-reporting", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Cost Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    // A run that died before the adapter reported usage: it burned real tokens
+    // and wrote no cost event. It must be counted, not silently dropped.
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      status: "failed",
+      startedAt: new Date("2026-04-10T00:00:00.000Z"),
+      finishedAt: new Date("2026-04-10T00:05:00.000Z"),
+      usageJson: null,
+    });
+
+    const summary = await costService(db).summary(companyId, {
+      from: new Date("2026-04-01T00:00:00.000Z"),
+      to: new Date("2026-04-15T23:59:59.999Z"),
+    });
+
+    expect(summary.unmeteredRunCount).toBe(1);
+    expect(summary.totalTokens).toBe(0);
+  });
+
+  it("rolls every firing of a routine up to the routine, including child issues", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const routineId = randomUUID();
+    const firingOneIssueId = randomUUID();
+    const firingTwoIssueId = randomUUID();
+    const childOfFiringTwoId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Triage Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Triagem de Slack",
+      assigneeAgentId: agentId,
+      status: "active",
+    });
+    await db.insert(issues).values([
+      {
+        id: firingOneIssueId,
+        companyId,
+        title: "Triagem 2026-04-10",
+        status: "done",
+        priority: "medium",
+        issueNumber: 1,
+        identifier: "TST-1",
+      },
+      {
+        id: firingTwoIssueId,
+        companyId,
+        title: "Triagem 2026-04-11",
+        status: "done",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: "TST-2",
+      },
+      {
+        id: childOfFiringTwoId,
+        companyId,
+        parentId: firingTwoIssueId,
+        title: "Follow-up spawned by the firing",
+        status: "done",
+        priority: "medium",
+        issueNumber: 3,
+        identifier: "TST-3",
+      },
+    ]);
+    await db.insert(routineRuns).values([
+      {
+        companyId,
+        routineId,
+        source: "schedule",
+        status: "completed",
+        linkedIssueId: firingOneIssueId,
+      },
+      {
+        companyId,
+        routineId,
+        source: "schedule",
+        status: "completed",
+        linkedIssueId: firingTwoIssueId,
+      },
+    ]);
+
+    const baseEvent = {
+      companyId,
+      agentId,
+      provider: "anthropic",
+      biller: "claude",
+      billingType: "subscription_included" as const,
+      model: "claude-haiku-4-5",
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      costCents: 0,
+    };
+    await db.insert(costEvents).values([
+      {
+        ...baseEvent,
+        issueId: firingOneIssueId,
+        heartbeatRunId: null,
+        inputTokens: 100,
+        occurredAt: new Date("2026-04-10T00:00:00.000Z"),
+      },
+      {
+        ...baseEvent,
+        issueId: firingTwoIssueId,
+        heartbeatRunId: null,
+        inputTokens: 200,
+        occurredAt: new Date("2026-04-11T00:00:00.000Z"),
+      },
+      {
+        ...baseEvent,
+        issueId: childOfFiringTwoId,
+        heartbeatRunId: null,
+        inputTokens: 400,
+        occurredAt: new Date("2026-04-11T00:05:00.000Z"),
+      },
+    ]);
+
+    const rows = await costService(db).byRoutine(companyId, {
+      from: new Date("2026-04-01T00:00:00.000Z"),
+      to: new Date("2026-04-15T23:59:59.999Z"),
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.routineTitle).toBe("Triagem de Slack");
+    // Both firings plus the child issue spawned by the second one.
+    expect(Number(rows[0]?.totalTokens)).toBe(700);
+    expect(Number(rows[0]?.issueCount)).toBe(3);
   });
 });
