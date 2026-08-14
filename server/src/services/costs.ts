@@ -18,6 +18,88 @@ function sumAsNumber(column: typeof costEvents.costCents | typeof costEvents.inp
   return sql<number>`coalesce(sum(${column}), 0)::double precision`;
 }
 
+/**
+ * Real dollar cost of subscription usage.
+ *
+ * `cost_events.cost_cents` is deliberately 0 for `subscription_included`
+ * (see normalizeBilledCostCents in heartbeat.ts) because the plan already paid
+ * for those tokens. That is correct for budget math and useless for capacity
+ * math: it is why the cost panel read $0 right up to the day the account was
+ * locked out. The dollar figure the provider actually attributes to the run
+ * only ever lands in `heartbeat_runs.usage_json`, so we read it back from
+ * there. Joining on `heartbeat_run_id` keeps this at one row per run — the
+ * same grain as the cost event — so it cannot double-count.
+ *
+ * `costUsd` is absent on some runs (not every adapter reports it), so this is
+ * a floor. Callers that need to say how much is missing use `unpricedRunCount`.
+ */
+function subscriptionCostUsdExpr() {
+  return sql<number>`coalesce(sum(
+    case
+      when ${costEvents.billingType} in (${sql.join(
+        SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`),
+        sql`, `,
+      )})
+      then coalesce(
+        (${heartbeatRuns.usageJson} ->> 'cacheAdjustedCostUsd')::double precision,
+        (${heartbeatRuns.usageJson} ->> 'costUsd')::double precision,
+        0
+      )
+      else 0
+    end
+  ), 0)::double precision`;
+}
+
+/** Cents actually billed through a metered API — the only spend that hits a card. */
+function meteredCostCentsExpr() {
+  return sql<number>`coalesce(sum(
+    case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.costCents} else 0 end
+  ), 0)::double precision`;
+}
+
+/** Subscription runs whose usage_json carried no dollar figure at all. */
+function unpricedRunCountExpr() {
+  return sql<number>`count(distinct case
+    when ${costEvents.billingType} in (${sql.join(
+      SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`),
+      sql`, `,
+    )})
+      and coalesce(
+        ${heartbeatRuns.usageJson} ->> 'cacheAdjustedCostUsd',
+        ${heartbeatRuns.usageJson} ->> 'costUsd'
+      ) is null
+    then ${costEvents.heartbeatRunId}
+  end)::int`;
+}
+
+/**
+ * Runs that finished inside the window but produced no cost_event at all.
+ *
+ * A run only writes a cost event when it reports token usage or a billed cost
+ * (heartbeat.ts `updateRuntimeState`), so a run that dies before the adapter
+ * returns usage — crash, cancel, timeout, lost process — consumed real tokens
+ * and recorded none. Surfacing the count is the honest alternative to silently
+ * reporting a total that is short by an unknown amount.
+ */
+async function countRunsWithoutCostEvents(db: Db, companyId: string, range?: CostDateRange) {
+  const conditions = [
+    eq(heartbeatRuns.companyId, companyId),
+    isNotNull(heartbeatRuns.startedAt),
+    sql`not exists (
+      select 1 from ${costEvents}
+      where ${costEvents.heartbeatRunId} = ${heartbeatRuns.id}
+    )`,
+  ];
+  if (range?.from) conditions.push(gte(heartbeatRuns.startedAt, range.from));
+  if (range?.to) conditions.push(lte(heartbeatRuns.startedAt, range.to));
+
+  const [row] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(heartbeatRuns)
+    .where(and(...conditions));
+  return Number(row?.count ?? 0);
+}
+
 function currentUtcMonthWindow(now = new Date()) {
   const year = now.getUTCFullYear();
   const month = now.getUTCMonth();
@@ -115,24 +197,60 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
       if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
 
-      const [{ total }] = await db
+      const [row] = await db
         .select({
           total: sumAsNumber(costEvents.costCents),
+          inputTokens: sumAsNumber(costEvents.inputTokens),
+          cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
+          outputTokens: sumAsNumber(costEvents.outputTokens),
+          // Subscription usage is billed at 0 cents by design (the plan already
+          // paid for it), so `spendCents` alone reads as "nothing is happening"
+          // even while the account burns through its quota. These two fields are
+          // what make subscription consumption visible before a lockout.
+          subscriptionCostUsd: subscriptionCostUsdExpr(),
+          meteredCostCents: meteredCostCentsExpr(),
+          eventCount: sql<number>`count(*)::int`,
+          runCount: sql<number>`count(distinct ${costEvents.heartbeatRunId})::int`,
+          unpricedRunCount: unpricedRunCountExpr(),
         })
         .from(costEvents)
+        // `heartbeat_runs.id` is the primary key and `cost_events.heartbeat_run_id`
+        // points at one row, so this join is 1:0..1 and cannot fan the sums out.
+        // It exists only to reach `usage_json`, where the subscription dollar
+        // figure lives.
+        .leftJoin(heartbeatRuns, eq(costEvents.heartbeatRunId, heartbeatRuns.id))
         .where(and(...conditions));
 
-      const spendCents = Number(total);
+      const spendCents = Number(row?.total ?? 0);
       const utilization =
         company.budgetMonthlyCents > 0
           ? (spendCents / company.budgetMonthlyCents) * 100
           : 0;
+
+      const inputTokens = Number(row?.inputTokens ?? 0);
+      const cachedInputTokens = Number(row?.cachedInputTokens ?? 0);
+      const outputTokens = Number(row?.outputTokens ?? 0);
+      const unmeteredRuns = await countRunsWithoutCostEvents(db, companyId, range);
 
       return {
         companyId,
         spendCents,
         budgetCents: company.budgetMonthlyCents,
         utilizationPercent: Number(utilization.toFixed(2)),
+        inputTokens,
+        cachedInputTokens,
+        outputTokens,
+        totalTokens: inputTokens + cachedInputTokens + outputTokens,
+        meteredCostCents: Number(row?.meteredCostCents ?? 0),
+        subscriptionCostUsd: Number(row?.subscriptionCostUsd ?? 0),
+        eventCount: Number(row?.eventCount ?? 0),
+        runCount: Number(row?.runCount ?? 0),
+        // Runs that did write a cost event but whose provider never reported a
+        // dollar figure. Their tokens are counted; their cost is not.
+        unpricedRunCount: Number(row?.unpricedRunCount ?? 0),
+        // Runs that produced no cost_event at all. Their consumption is not in
+        // any total above, so every number here is a floor, not a ceiling.
+        unmeteredRunCount: unmeteredRuns,
       };
     },
 
@@ -456,6 +574,152 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           costEvents.model,
         )
         .orderBy(costEvents.provider, costEvents.biller, costEvents.billingType, costEvents.model);
+    },
+
+    /**
+     * Tokens and cost per issue, ranked.
+     *
+     * Attribution note (this is the whole point of the endpoint): a run is
+     * attributed to exactly one issue — the one in its `contextSnapshot.issueId`,
+     * resolved once at run finalization into `cost_events.issue_id`. Summing
+     * `GET /issues/{id}/runs` instead inflates the company total by ~87%,
+     * because that route returns the full run — usage included — to every
+     * issue the run happened to touch, and one run touched 61 of them.
+     * Grouping on the cost event keeps one row per run, so these rows sum to
+     * the company total rather than to a multiple of it.
+     *
+     * Cost events with a null `issue_id` (work done outside any issue) are
+     * excluded here and reported by `summary` instead, so the difference
+     * between this list and the company total stays visible.
+     */
+    byIssue: async (companyId: string, range?: CostDateRange, limit = 20) => {
+      const conditions: ReturnType<typeof eq>[] = [
+        eq(costEvents.companyId, companyId),
+        isNotNull(costEvents.issueId),
+      ];
+      if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
+      if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
+
+      const totalTokensExpr = sql<number>`coalesce(sum(
+        ${costEvents.inputTokens} + ${costEvents.cachedInputTokens} + ${costEvents.outputTokens}
+      ), 0)::double precision`;
+
+      return db
+        .select({
+          issueId: costEvents.issueId,
+          issueIdentifier: issues.identifier,
+          issueTitle: issues.title,
+          issueStatus: issues.status,
+          projectId: issues.projectId,
+          projectName: projects.name,
+          costCents: sumAsNumber(costEvents.costCents),
+          meteredCostCents: meteredCostCentsExpr(),
+          subscriptionCostUsd: subscriptionCostUsdExpr(),
+          inputTokens: sumAsNumber(costEvents.inputTokens),
+          cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
+          outputTokens: sumAsNumber(costEvents.outputTokens),
+          totalTokens: totalTokensExpr,
+          runCount: sql<number>`count(distinct ${costEvents.heartbeatRunId})::int`,
+          unpricedRunCount: unpricedRunCountExpr(),
+        })
+        .from(costEvents)
+        .innerJoin(issues, eq(costEvents.issueId, issues.id))
+        .leftJoin(projects, eq(issues.projectId, projects.id))
+        .leftJoin(heartbeatRuns, eq(costEvents.heartbeatRunId, heartbeatRuns.id))
+        .where(and(...conditions, visibleIssueCondition()))
+        .groupBy(
+          costEvents.issueId,
+          issues.identifier,
+          issues.title,
+          issues.status,
+          issues.projectId,
+          projects.name,
+        )
+        .orderBy(desc(totalTokensExpr))
+        .limit(limit);
+    },
+
+    /**
+     * Tokens and cost per routine, aggregated across every firing.
+     *
+     * Each firing opens its own issue (`routine_runs.linked_issue_id`), so a
+     * daily routine's cost is otherwise spread across dozens of unrelated-looking
+     * issues — Slack triage alone opened ~20. Rolling the linked issues back up
+     * to the routine is the only way to see what a recurring job actually costs.
+     *
+     * Costs are counted through the linked issue's whole subtree, because a
+     * routine firing routinely spawns child issues and the work delegated to a
+     * child is still that routine's cost. `distinct` on the cost event id keeps
+     * an issue reachable by two paths from being counted twice.
+     */
+    byRoutine: async (companyId: string, range?: CostDateRange, limit = 20) => {
+      // Bound as ISO text with an explicit cast: this statement goes through
+      // `db.execute`, which hands parameters straight to the driver without the
+      // column-type mapping a Drizzle column reference would carry, and the
+      // driver rejects a raw Date.
+      const rangeFilter =
+        range?.from || range?.to
+          ? sql`
+              AND (${range?.from ? sql`ce.occurred_at >= ${range.from.toISOString()}::timestamptz` : sql`true`})
+              AND (${range?.to ? sql`ce.occurred_at <= ${range.to.toISOString()}::timestamptz` : sql`true`})
+            `
+          : sql``;
+
+      const rows = await db.execute(sql`
+        WITH RECURSIVE routine_issue_tree(routine_id, issue_id) AS (
+          SELECT rr.routine_id, rr.linked_issue_id
+          FROM routine_runs rr
+          WHERE rr.company_id = ${companyId}
+            AND rr.linked_issue_id IS NOT NULL
+          UNION
+          SELECT t.routine_id, i.id
+          FROM issues i
+          JOIN routine_issue_tree t ON i.parent_id = t.issue_id
+          WHERE i.company_id = ${companyId}
+            AND i.hidden_at IS NULL
+            AND i.harness_kind IS NULL
+        )
+        SELECT
+          r.id AS "routineId",
+          r.title AS "routineTitle",
+          r.status AS "routineStatus",
+          r.assignee_agent_id AS "assigneeAgentId",
+          a.name AS "assigneeAgentName",
+          count(DISTINCT t.issue_id)::int AS "issueCount",
+          count(DISTINCT ce.heartbeat_run_id)::int AS "runCount",
+          coalesce(sum(ce.cost_cents), 0)::double precision AS "costCents",
+          coalesce(sum(ce.input_tokens), 0)::double precision AS "inputTokens",
+          coalesce(sum(ce.cached_input_tokens), 0)::double precision AS "cachedInputTokens",
+          coalesce(sum(ce.output_tokens), 0)::double precision AS "outputTokens",
+          coalesce(sum(
+            ce.input_tokens + ce.cached_input_tokens + ce.output_tokens
+          ), 0)::double precision AS "totalTokens",
+          coalesce(sum(
+            CASE WHEN ce.billing_type IN ('subscription_included', 'subscription_overage')
+              THEN coalesce(
+                (hr.usage_json ->> 'cacheAdjustedCostUsd')::double precision,
+                (hr.usage_json ->> 'costUsd')::double precision,
+                0)
+              ELSE 0 END
+          ), 0)::double precision AS "subscriptionCostUsd"
+        FROM routines r
+        LEFT JOIN routine_issue_tree t ON t.routine_id = r.id
+        LEFT JOIN (
+          SELECT DISTINCT ON (id) id, issue_id, heartbeat_run_id, billing_type,
+                 cost_cents, input_tokens, cached_input_tokens, output_tokens, occurred_at
+          FROM cost_events
+          WHERE company_id = ${companyId}
+        ) ce ON ce.issue_id = t.issue_id ${rangeFilter}
+        LEFT JOIN heartbeat_runs hr ON hr.id = ce.heartbeat_run_id
+        LEFT JOIN agents a ON a.id = r.assignee_agent_id
+        WHERE r.company_id = ${companyId}
+        GROUP BY r.id, r.title, r.status, r.assignee_agent_id, a.name
+        ORDER BY "totalTokens" DESC
+        LIMIT ${limit}
+      `);
+
+      const list = Array.isArray(rows) ? rows : ((rows as { rows?: unknown[] }).rows ?? []);
+      return list as Array<Record<string, unknown>>;
     },
 
     byProject: async (companyId: string, range?: CostDateRange) => {
