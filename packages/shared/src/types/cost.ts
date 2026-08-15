@@ -118,12 +118,24 @@ export interface CostWindowSpendRow {
   outputTokens: number;
 }
 
-/** cost attributed to a project via heartbeat run → activity log → issue → project chain */
+/**
+ * cost attributed to a project through the cost-event ledger: the event's own
+ * project, falling back to the project of the issue that owns the run.
+ *
+ * one row per run, so these rows sum to the same total as the by-agent cut.
+ * events that resolve to no project are omitted rather than folded in.
+ */
 export interface CostByProject {
   projectId: string | null;
   projectName: string | null;
   costCents: number;
+  /** cents actually billed through a metered api — the only spend that hits a card */
+  meteredCostCents: number;
+  /** dollar value of subscription usage, which bills 0 cents by design */
+  subscriptionCostUsd: number;
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
+  totalTokens: number;
+  runCount: number;
 }

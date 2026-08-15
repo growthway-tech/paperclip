@@ -43,7 +43,12 @@ Returns per-agent cost breakdown for the current month.
 GET /api/companies/{companyId}/costs/by-project
 ```
 
-Returns per-project cost breakdown for the current month.
+Returns per-project cost and token breakdown for the current month.
+
+Each run is counted once, against the project of the task that owns it, so this
+cut and `by-agent` sum to the same company total. Cost events that resolve to no
+project are omitted from the list rather than folded into one — compare against
+`costs/summary` to see that remainder.
 
 ## Budget Management
 

@@ -19,6 +19,22 @@ function sumAsNumber(column: typeof costEvents.costCents | typeof costEvents.inp
 }
 
 /**
+ * Total tokens on a cost event.
+ *
+ * The per-term `::bigint` cast is load-bearing: the token columns are `integer`,
+ * so adding them is int4 arithmetic that raises `integer out of range` on any
+ * row near the int32 ceiling — before `sum` ever widens the result. Widening
+ * the sum alone does not help; the addition inside it has to be widened too.
+ */
+function totalTokensExpr() {
+  return sql<number>`coalesce(sum(
+    ${costEvents.inputTokens}::bigint
+      + ${costEvents.cachedInputTokens}::bigint
+      + ${costEvents.outputTokens}::bigint
+  ), 0)::double precision`;
+}
+
+/**
  * Real dollar cost of subscription usage.
  *
  * `cost_events.cost_cents` is deliberately 0 for `subscription_included`
@@ -600,9 +616,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
       if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
 
-      const totalTokensExpr = sql<number>`coalesce(sum(
-        ${costEvents.inputTokens} + ${costEvents.cachedInputTokens} + ${costEvents.outputTokens}
-      ), 0)::double precision`;
+      const totalTokens = totalTokensExpr();
 
       return db
         .select({
@@ -618,7 +632,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
           outputTokens: sumAsNumber(costEvents.outputTokens),
-          totalTokens: totalTokensExpr,
+          totalTokens,
           runCount: sql<number>`count(distinct ${costEvents.heartbeatRunId})::int`,
           unpricedRunCount: unpricedRunCountExpr(),
         })
@@ -635,7 +649,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           issues.projectId,
           projects.name,
         )
-        .orderBy(desc(totalTokensExpr))
+        .orderBy(desc(totalTokens))
         .limit(limit);
     },
 
@@ -691,8 +705,10 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           coalesce(sum(ce.input_tokens), 0)::double precision AS "inputTokens",
           coalesce(sum(ce.cached_input_tokens), 0)::double precision AS "cachedInputTokens",
           coalesce(sum(ce.output_tokens), 0)::double precision AS "outputTokens",
+          -- ::bigint per term, not on the sum: the columns are integer, so the
+          -- addition itself overflows int4 before sum can widen it.
           coalesce(sum(
-            ce.input_tokens + ce.cached_input_tokens + ce.output_tokens
+            ce.input_tokens::bigint + ce.cached_input_tokens::bigint + ce.output_tokens::bigint
           ), 0)::double precision AS "totalTokens",
           coalesce(sum(
             CASE WHEN ce.billing_type IN ('subscription_included', 'subscription_overage')
@@ -722,54 +738,57 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       return list as Array<Record<string, unknown>>;
     },
 
+    /**
+     * Tokens and cost per project.
+     *
+     * Attribution note, same as `byIssue`: this aggregates the ledger, where a
+     * run has exactly one row. The previous implementation resolved the project
+     * through `activity_log`, which links a run to *every* issue it touched —
+     * one row per (run, project) pair — so a run that touched issues in three
+     * projects was counted three times, with its full usage in each. That is
+     * why `by-project` read 16% *above* `by-agent` while both aggregate the
+     * same universe of runs; two cuts of the same ledger must sum to the same
+     * total.
+     *
+     * The project now comes from the cost event's own `project_id`, falling
+     * back to the owning issue's project — the same owner-per-run resolution
+     * `resolveLedgerScopeForRun` writes at run finalization. Joining `issues`
+     * on `cost_events.issue_id` is 1:0..1, so it cannot fan out.
+     *
+     * Events that resolve to no project (no `project_id`, no owning issue, or
+     * an issue with no project) are excluded here rather than folded into some
+     * project. `summary` reports the company total, so that remainder stays
+     * visible as the difference instead of silently inflating a project.
+     */
     byProject: async (companyId: string, range?: CostDateRange) => {
-      const issueIdAsText = sql<string>`${issues.id}::text`;
-      const runProjectLinks = db
-        .selectDistinctOn([activityLog.runId, issues.projectId], {
-          runId: activityLog.runId,
-          projectId: issues.projectId,
-        })
-        .from(activityLog)
-        .innerJoin(
-          issues,
-          and(
-            eq(activityLog.entityType, "issue"),
-            eq(activityLog.entityId, issueIdAsText),
-          ),
-        )
-        .where(
-          and(
-            eq(activityLog.companyId, companyId),
-            eq(issues.companyId, companyId),
-            isNotNull(activityLog.runId),
-            isNotNull(issues.projectId),
-          ),
-        )
-        .orderBy(activityLog.runId, issues.projectId, desc(activityLog.createdAt))
-        .as("run_project_links");
-
-      const effectiveProjectId = sql<string | null>`coalesce(${costEvents.projectId}, ${runProjectLinks.projectId})`;
+      const effectiveProjectId = sql<string | null>`coalesce(${costEvents.projectId}, ${issues.projectId})`;
       const conditions: ReturnType<typeof eq>[] = [eq(costEvents.companyId, companyId)];
       if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
       if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
 
       const costCentsExpr = sumAsNumber(costEvents.costCents);
+      const totalTokens = totalTokensExpr();
 
       return db
         .select({
           projectId: effectiveProjectId,
           projectName: projects.name,
           costCents: costCentsExpr,
+          meteredCostCents: meteredCostCentsExpr(),
+          subscriptionCostUsd: subscriptionCostUsdExpr(),
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
           outputTokens: sumAsNumber(costEvents.outputTokens),
+          totalTokens,
+          runCount: sql<number>`count(distinct ${costEvents.heartbeatRunId})::int`,
         })
         .from(costEvents)
-        .leftJoin(runProjectLinks, eq(costEvents.heartbeatRunId, runProjectLinks.runId))
+        .leftJoin(issues, and(eq(costEvents.issueId, issues.id), eq(issues.companyId, companyId)))
         .innerJoin(projects, sql`${projects.id} = ${effectiveProjectId}`)
+        .leftJoin(heartbeatRuns, eq(costEvents.heartbeatRunId, heartbeatRuns.id))
         .where(and(...conditions, sql`${effectiveProjectId} is not null`))
         .groupBy(effectiveProjectId, projects.name)
-        .orderBy(desc(costCentsExpr));
+        .orderBy(desc(totalTokens));
     },
   };
 }

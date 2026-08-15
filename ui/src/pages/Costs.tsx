@@ -834,7 +834,9 @@ export function Costs({
                   <Card>
                     <CardHeader className="px-5 pt-5 pb-2">
                       <CardTitle className="text-base">By project</CardTitle>
-                      <CardDescription>Run costs attributed through project-linked tasks.</CardDescription>
+                      <CardDescription>
+                        Each run counted once, against the project of the task that owns it.
+                      </CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-2 px-5 pb-5 pt-2">
                       {(spendData?.byProject.length ?? 0) === 0 ? (
@@ -843,10 +845,18 @@ export function Costs({
                         spendData?.byProject.map((row, index) => (
                           <div
                             key={row.projectId ?? `unattributed-${index}`}
-                            className="flex items-center justify-between gap-3 border border-border px-3 py-2 text-sm"
+                            className="flex items-start justify-between gap-3 border border-border px-3 py-2 text-sm"
                           >
                             <span className="truncate">{row.projectName ?? row.projectId ?? "Unattributed"}</span>
-                            <span className="font-medium tabular-nums">{formatCents(row.costCents)}</span>
+                            <div className="text-right tabular-nums">
+                              <div className="font-medium">{formatCents(row.costCents)}</div>
+                              {/* Subscription runs bill 0 cents, so tokens are the only
+                                  signal that a project is consuming anything at all. */}
+                              <div className="text-xs text-muted-foreground">
+                                {formatTokens(row.totalTokens)} tok · {row.runCount} run
+                                {row.runCount === 1 ? "" : "s"}
+                              </div>
+                            </div>
                           </div>
                         ))
                       )}

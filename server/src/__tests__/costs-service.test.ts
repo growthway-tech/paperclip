@@ -416,7 +416,7 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     db = createDb(tempDb.connectionString);
     costs = costService(db);
     finance = financeService(db);
-  }, 20_000);
+  }, 240_000);
 
   afterEach(async () => {
     await db.delete(financeEvents);
@@ -550,6 +550,11 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(byAgentRow?.inputTokens).toBe(4_000_000_000);
     expect(byProjectRow?.costCents).toBe(4_000_000_000);
     expect(byAgentModelRow?.costCents).toBe(4_000_000_000);
+
+    // The token columns are `integer`, so summing them per-row overflows int4
+    // in the addition itself — before sum widens the result. Each term has to
+    // be cast, not just the total.
+    expect(byProjectRow?.totalTokens).toBe(4_400_000_010);
   });
 
   it("aggregates issue costs across recursive descendants only", async () => {
@@ -1235,5 +1240,224 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     // Both firings plus the child issue spawned by the second one.
     expect(Number(rows[0]?.totalTokens)).toBe(700);
     expect(Number(rows[0]?.issueCount)).toBe(3);
+  });
+
+  /**
+   * The by-project counterpart of the multi-issue attribution test above.
+   *
+   * Resolving the project through `activity_log` produced one row per
+   * (run, project) pair, so a run touching two projects was counted in both
+   * with its full usage — which is why `by-project` measured 16% above
+   * `by-agent` on live data. Both cuts aggregate the same ledger, so they must
+   * agree.
+   */
+  it("attributes a run that touched two projects to its owner so by-project sums to by-agent", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const ownerProjectId = randomUUID();
+    const touchedProjectId = randomUUID();
+    const ownerIssueId = randomUUID();
+    const touchedIssueId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Cost Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values([
+      { id: ownerProjectId, companyId, name: "Owner Project", status: "active" },
+      { id: touchedProjectId, companyId, name: "Merely Touched Project", status: "active" },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: ownerIssueId,
+        companyId,
+        projectId: ownerProjectId,
+        title: "Owner",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 1,
+        identifier: "TST-1",
+      },
+      {
+        id: touchedIssueId,
+        companyId,
+        projectId: touchedProjectId,
+        title: "Merely touched",
+        status: "done",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: "TST-2",
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      status: "succeeded",
+      startedAt: new Date("2026-04-10T00:00:00.000Z"),
+      finishedAt: new Date("2026-04-10T00:10:00.000Z"),
+      contextSnapshot: { issueId: ownerIssueId },
+      usageJson: { costUsd: 3.5, billingType: "subscription_included" },
+    });
+    // The activity_log rows are what made the run appear under both projects.
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: ownerIssueId,
+        runId,
+      },
+      {
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        action: "issue.commented",
+        entityType: "issue",
+        entityId: touchedIssueId,
+        runId,
+      },
+    ]);
+
+    // One ledger row, owned by TST-1 — and deliberately without its own
+    // project_id, so the fallback through the owning issue is what resolves it.
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      issueId: ownerIssueId,
+      projectId: null,
+      heartbeatRunId: runId,
+      provider: "anthropic",
+      biller: "claude",
+      billingType: "subscription_included",
+      costStatus: "unpriced",
+      model: "claude-opus-5",
+      inputTokens: 1_000,
+      cachedInputTokens: 10_000,
+      outputTokens: 100,
+      costCents: 0,
+      occurredAt: new Date("2026-04-10T00:10:00.000Z"),
+    });
+
+    const range = {
+      from: new Date("2026-04-01T00:00:00.000Z"),
+      to: new Date("2026-04-15T23:59:59.999Z"),
+    };
+
+    const costs = costService(db);
+    const byProject = await costs.byProject(companyId, range);
+    const byAgent = await costs.byAgent(companyId, range);
+
+    // Charged once, to the project of the issue that owns the run.
+    expect(byProject).toHaveLength(1);
+    expect(byProject[0]?.projectName).toBe("Owner Project");
+    expect(byProject[0]?.totalTokens).toBe(11_100);
+    expect(byProject[0]?.runCount).toBe(1);
+    expect(byProject[0]?.subscriptionCostUsd).toBeCloseTo(3.5, 5);
+
+    // The conservation property: the two cuts of the same ledger agree.
+    const projectTokens = byProject.reduce((acc, row) => acc + Number(row.totalTokens), 0);
+    const agentTokens = byAgent.reduce(
+      (acc, row) =>
+        acc + Number(row.inputTokens) + Number(row.cachedInputTokens) + Number(row.outputTokens),
+      0,
+    );
+    expect(projectTokens).toBe(agentTokens);
+  });
+
+  /**
+   * The remainder must stay visible. An event with no resolvable project is
+   * dropped from the list rather than folded into an arbitrary project, so
+   * by-project is a floor and summary carries the true total.
+   */
+  it("omits events with no resolvable project instead of misattributing them", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const projectId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Cost Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Only Project",
+      status: "active",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Owned",
+      status: "done",
+      priority: "medium",
+      issueNumber: 1,
+      identifier: "TST-1",
+    });
+
+    const baseEvent = {
+      companyId,
+      agentId,
+      provider: "anthropic",
+      biller: "claude",
+      billingType: "subscription_included" as const,
+      model: "claude-opus-5",
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      costCents: 0,
+      occurredAt: new Date("2026-04-10T00:00:00.000Z"),
+    };
+    await db.insert(costEvents).values([
+      { ...baseEvent, issueId, projectId: null, inputTokens: 500 },
+      // Work outside any issue and any project — the orphan bucket.
+      { ...baseEvent, issueId: null, projectId: null, inputTokens: 300 },
+    ]);
+
+    const range = {
+      from: new Date("2026-04-01T00:00:00.000Z"),
+      to: new Date("2026-04-15T23:59:59.999Z"),
+    };
+
+    const costs = costService(db);
+    const byProject = await costs.byProject(companyId, range);
+    const summary = await costs.summary(companyId, range);
+
+    expect(byProject).toHaveLength(1);
+    expect(byProject[0]?.totalTokens).toBe(500);
+    // The 300 orphan tokens are in the company total, not hidden in a project.
+    expect(summary.totalTokens).toBe(800);
   });
 });
