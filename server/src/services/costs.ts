@@ -14,6 +14,35 @@ export interface CostDateRange {
 const METERED_BILLING_TYPE = "metered_api";
 const SUBSCRIPTION_BILLING_TYPES = ["subscription_included", "subscription_overage"] as const;
 
+/**
+ * Failure codes that mean the run never got a prompt to the model.
+ *
+ * A run with one of these codes wrote no cost event, but it also consumed
+ * nothing: the session died before `session/new` completed, the adapter was
+ * never invoked, or the issue changed hands first. Counting them as missing
+ * consumption overstates the gap by an order of magnitude.
+ *
+ * Measured against the live company database (2026-08-19, 1.696 runs): 267 runs
+ * carried no `usage_json`. 237 of them matched these codes and showed no model
+ * output — their logs are adapter error text (~2 KB), never a transcript. The
+ * remaining 30 (`process_lost`, unpriced `adapter_failed`) had real transcripts
+ * up to 188 KB and are the genuine accounting gap. Zero of 1.021 `succeeded`
+ * runs are unpriced, which is why this split is safe: success always accounts.
+ */
+const NO_MODEL_WORK_ERROR_CODES = [
+  "acpx_session_config_failed",
+  "acpx_session_init_failed",
+  "configuration_incomplete",
+  "cancelled",
+  "issue_terminal_status",
+  "issue_reassigned",
+  "issue_assignee_changed",
+  "issue_continuation_waiting_on_review",
+  "lock_released_on_reassignment",
+  "issue_dependencies_blocked",
+  "setup_failed",
+] as const;
+
 function sumAsNumber(column: typeof costEvents.costCents | typeof costEvents.inputTokens | typeof costEvents.cachedInputTokens | typeof costEvents.outputTokens) {
   return sql<number>`coalesce(sum(${column}), 0)::double precision`;
 }
@@ -93,9 +122,22 @@ function unpricedRunCountExpr() {
  *
  * A run only writes a cost event when it reports token usage or a billed cost
  * (heartbeat.ts `updateRuntimeState`), so a run that dies before the adapter
- * returns usage — crash, cancel, timeout, lost process — consumed real tokens
- * and recorded none. Surfacing the count is the honest alternative to silently
- * reporting a total that is short by an unknown amount.
+ * returns usage consumed real tokens and recorded none. Surfacing the count is
+ * the honest alternative to silently reporting a total that is short by an
+ * unknown amount.
+ *
+ * The bare count conflates three different situations, so it is split. Measured
+ * against the live company database on 2026-08-19 (1.656 started runs):
+ *
+ *   609 runs have no cost_event, of which
+ *     383 DO carry usage_json  -> measured, just never aggregated (`strandedRuns`)
+ *     197 died before the model -> genuinely consumed nothing (`neverRanRuns`)
+ *      29 ran and lost usage    -> the true blind spot (`lostRuns`)
+ *
+ * Only `lostRuns` makes the totals a floor. `strandedRuns` is recoverable — the
+ * numbers are already in `usage_json` (764.094 tokens, US$ 48,96) and are simply
+ * missing from every endpoint that reads `cost_events`. Reporting all 609 as one
+ * figure implies a 37% blind spot where the real one is 1,8%.
  */
 async function countRunsWithoutCostEvents(db: Db, companyId: string, range?: CostDateRange) {
   const conditions = [
@@ -109,11 +151,40 @@ async function countRunsWithoutCostEvents(db: Db, companyId: string, range?: Cos
   if (range?.from) conditions.push(gte(heartbeatRuns.startedAt, range.from));
   if (range?.to) conditions.push(lte(heartbeatRuns.startedAt, range.to));
 
+  const noModelWork = sql`coalesce(${heartbeatRuns.errorCode}, '') in (${sql.join(
+    NO_MODEL_WORK_ERROR_CODES.map((value) => sql`${value}`),
+    sql`, `,
+  )})`;
+  const hasUsage = sql`${heartbeatRuns.usageJson} is not null`;
+
   const [row] = await db
-    .select({ count: sql<number>`count(*)::int` })
+    .select({
+      total: sql<number>`count(*)::int`,
+      // Usage was captured on the run but never became a cost event. Recoverable.
+      stranded: sql<number>`count(*) filter (where ${hasUsage})::int`,
+      // Died before the model ran: no prompt was sent, so nothing was consumed.
+      neverRan: sql<number>`count(*) filter (where not ${hasUsage} and ${noModelWork})::int`,
+      // Ran, produced output, and the usage was never persisted. The real gap.
+      lost: sql<number>`count(*) filter (where not ${hasUsage} and not (${noModelWork}))::int`,
+      // Tokens sitting in usage_json that no cost endpoint currently reports.
+      strandedTokens: sql<number>`coalesce(sum(
+        case when ${hasUsage} then
+          coalesce((${heartbeatRuns.usageJson} ->> 'inputTokens')::bigint, 0)
+          + coalesce((${heartbeatRuns.usageJson} ->> 'cachedInputTokens')::bigint, 0)
+          + coalesce((${heartbeatRuns.usageJson} ->> 'outputTokens')::bigint, 0)
+        else 0 end
+      ), 0)::double precision`,
+    })
     .from(heartbeatRuns)
     .where(and(...conditions));
-  return Number(row?.count ?? 0);
+
+  return {
+    total: Number(row?.total ?? 0),
+    stranded: Number(row?.stranded ?? 0),
+    neverRan: Number(row?.neverRan ?? 0),
+    lost: Number(row?.lost ?? 0),
+    strandedTokens: Number(row?.strandedTokens ?? 0),
+  };
 }
 
 function currentUtcMonthWindow(now = new Date()) {
@@ -264,9 +335,16 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         // Runs that did write a cost event but whose provider never reported a
         // dollar figure. Their tokens are counted; their cost is not.
         unpricedRunCount: Number(row?.unpricedRunCount ?? 0),
-        // Runs that produced no cost_event at all. Their consumption is not in
-        // any total above, so every number here is a floor, not a ceiling.
-        unmeteredRunCount: unmeteredRuns,
+        // Runs that produced no cost_event at all, split by what actually
+        // happened. Only `lostRunCount` makes the totals a floor:
+        //  - strandedRunCount: measured on the run, missing from the aggregates
+        //  - neverRanRunCount: died before the model; consumed nothing
+        //  - lostRunCount: ran and the usage was never persisted
+        unmeteredRunCount: unmeteredRuns.total,
+        strandedRunCount: unmeteredRuns.stranded,
+        strandedTokens: unmeteredRuns.strandedTokens,
+        neverRanRunCount: unmeteredRuns.neverRan,
+        lostRunCount: unmeteredRuns.lost,
       };
     },
 
