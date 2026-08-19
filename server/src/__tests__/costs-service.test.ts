@@ -1089,14 +1089,16 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
       permissions: {},
     });
 
-    // A run that died before the adapter reported usage: it burned real tokens
-    // and wrote no cost event. It must be counted, not silently dropped.
+    // A run whose process was lost mid-flight: the model worked, the usage was
+    // never persisted. It burned real tokens and wrote no cost event, so it
+    // must be counted, not silently dropped.
     await db.insert(heartbeatRuns).values({
       id: randomUUID(),
       companyId,
       agentId,
       invocationSource: "on_demand",
       status: "failed",
+      errorCode: "process_lost",
       startedAt: new Date("2026-04-10T00:00:00.000Z"),
       finishedAt: new Date("2026-04-10T00:05:00.000Z"),
       usageJson: null,
@@ -1108,7 +1110,106 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     });
 
     expect(summary.unmeteredRunCount).toBe(1);
+    expect(summary.lostRunCount).toBe(1);
     expect(summary.totalTokens).toBe(0);
+  });
+
+  it("does not report a run that died before the model ran as lost consumption", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Cost Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    // The ACP session never completed `session/new`, so no prompt reached the
+    // model. This run is a true zero — counting it as missing consumption is
+    // what made the gap look ~9x larger than it is.
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      status: "failed",
+      errorCode: "acpx_session_init_failed",
+      startedAt: new Date("2026-04-10T00:00:00.000Z"),
+      finishedAt: new Date("2026-04-10T00:05:00.000Z"),
+      usageJson: null,
+    });
+
+    const summary = await costService(db).summary(companyId, {
+      from: new Date("2026-04-01T00:00:00.000Z"),
+      to: new Date("2026-04-15T23:59:59.999Z"),
+    });
+
+    expect(summary.unmeteredRunCount).toBe(1);
+    expect(summary.neverRanRunCount).toBe(1);
+    // The number that says "the totals are a floor" must stay clean.
+    expect(summary.lostRunCount).toBe(0);
+  });
+
+  it("reports usage measured on a run but never aggregated as stranded, not lost", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Cost Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    // The adapter failed but still reported usage. The tokens are recorded on the
+    // run and absent from cost_events, so every endpoint that aggregates cost
+    // events silently omits them. That is recoverable, not a blind spot.
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      status: "failed",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-04-10T00:00:00.000Z"),
+      finishedAt: new Date("2026-04-10T00:05:00.000Z"),
+      usageJson: { inputTokens: 1000, cachedInputTokens: 200, outputTokens: 300 },
+    });
+
+    const summary = await costService(db).summary(companyId, {
+      from: new Date("2026-04-01T00:00:00.000Z"),
+      to: new Date("2026-04-15T23:59:59.999Z"),
+    });
+
+    expect(summary.unmeteredRunCount).toBe(1);
+    expect(summary.strandedRunCount).toBe(1);
+    expect(summary.strandedTokens).toBe(1500);
+    // It was measured, so it is neither a true zero nor an unknown.
+    expect(summary.neverRanRunCount).toBe(0);
+    expect(summary.lostRunCount).toBe(0);
   });
 
   it("rolls every firing of a routine up to the routine, including child issues", async () => {
