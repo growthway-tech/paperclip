@@ -2,6 +2,7 @@ import { and, desc, eq, gte, isNotNull, isNull, lt, lte, sql } from "drizzle-orm
 import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agents, companies, costEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
+import type { CostByRoutine } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { budgetService, type BudgetServiceHooks } from "./budgets.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -797,7 +798,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       `);
 
       const list = Array.isArray(rows) ? rows : ((rows as { rows?: unknown[] }).rows ?? []);
-      return list as Array<Record<string, unknown>>;
+      return list as CostByRoutine[];
     },
 
     byProject: async (companyId: string, range?: CostDateRange) => {
