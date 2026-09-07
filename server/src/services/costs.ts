@@ -127,14 +127,21 @@ function unpricedRunCountExpr() {
 async function countRunsWithoutCostEvents(db: Db, companyId: string, range?: CostDateRange) {
   const conditions = [
     eq(heartbeatRuns.companyId, companyId),
-    isNotNull(heartbeatRuns.startedAt),
+    // Only finalized runs can be missing a cost event. A run gets `startedAt`
+    // when it is claimed but writes its cost event at finalization, so counting
+    // by start time reports every run currently in flight as lost consumption.
+    isNotNull(heartbeatRuns.finishedAt),
     sql`not exists (
       select 1 from ${costEvents}
       where ${costEvents.heartbeatRunId} = ${heartbeatRuns.id}
     )`,
   ];
-  if (range?.from) conditions.push(gte(heartbeatRuns.startedAt, range.from));
-  if (range?.to) conditions.push(lte(heartbeatRuns.startedAt, range.to));
+  // Windowed on finalization, matching `cost_events.occurred_at`: filtering on
+  // start time would put a run that crosses midnight in a different window here
+  // than in the ledger, so the gap count would not line up with the totals it
+  // qualifies.
+  if (range?.from) conditions.push(gte(heartbeatRuns.finishedAt, range.from));
+  if (range?.to) conditions.push(lte(heartbeatRuns.finishedAt, range.to));
 
   const noModelWork = sql`coalesce(${heartbeatRuns.errorCode}, '') in (${sql.join(
     NO_MODEL_WORK_ERROR_CODES.map((value) => sql`${value}`),
@@ -670,8 +677,20 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
      * Cost events with a null `issue_id` (work done outside any issue) are
      * excluded here and reported by `summary` instead, so the difference
      * between this list and the company total stays visible.
+     *
+     * `offset` makes that conservation property actually checkable. The rows are
+     * ranked and capped, so on a company with more than `limit` cost-bearing
+     * issues a single response is a top-N, not the aggregate; without a way to
+     * page past the cap, summing the endpoint could never reproduce the company
+     * total the way the acceptance criterion requires. The order is total tokens
+     * descending, tie-broken on `issue_id` so paging is stable across calls.
      */
-    byIssue: async (companyId: string, range?: CostDateRange, limit = 20) => {
+    byIssue: async (
+      companyId: string,
+      range?: CostDateRange,
+      limit = 20,
+      offset = 0,
+    ) => {
       const conditions: ReturnType<typeof eq>[] = [
         eq(costEvents.companyId, companyId),
         isNotNull(costEvents.issueId),
@@ -714,8 +733,9 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           issues.projectId,
           projects.name,
         )
-        .orderBy(desc(totalTokensExpr))
-        .limit(limit);
+        .orderBy(desc(totalTokensExpr), costEvents.issueId)
+        .limit(limit)
+        .offset(offset);
     },
 
     /**
@@ -728,10 +748,31 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
      *
      * Costs are counted through the linked issue's whole subtree, because a
      * routine firing routinely spawns child issues and the work delegated to a
-     * child is still that routine's cost. `distinct` on the cost event id keeps
-     * an issue reachable by two paths from being counted twice.
+     * child is still that routine's cost.
+     *
+     * The subtrees are kept disjoint on purpose, so the rows can be summed. Two
+     * rules do that:
+     *
+     *  - the walk stops at any issue that is itself some routine's firing root.
+     *    Nothing forbids a routine firing from being parented to another
+     *    routine's firing (parent validation only checks company ownership), and
+     *    without the cut the nested firing and its whole subtree would land in
+     *    both routine trees and its cost would be summed into both rows, so the
+     *    routine totals could exceed the company total. The cost stays with the
+     *    routine that opened the issue, which is the one that caused the spend.
+     *  - the firing root passes the same visibility test as the recursive step.
+     *    A root that was later hidden, or that is harness work, is excluded from
+     *    `byIssue` and from issue-tree accounting, so counting it here would
+     *    make the two views disagree.
+     *
+     * Paged like `byIssue`, and for the same reason.
      */
-    byRoutine: async (companyId: string, range?: CostDateRange, limit = 20) => {
+    byRoutine: async (
+      companyId: string,
+      range?: CostDateRange,
+      limit = 20,
+      offset = 0,
+    ) => {
       // Bound as ISO text with an explicit cast: this statement goes through
       // `db.execute`, which hands parameters straight to the driver without the
       // column-type mapping a Drizzle column reference would carry, and the
@@ -745,11 +786,19 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           : sql``;
 
       const rows = await db.execute(sql`
-        WITH RECURSIVE routine_issue_tree(routine_id, issue_id) AS (
-          SELECT rr.routine_id, rr.linked_issue_id
+        WITH RECURSIVE firing_root AS (
+          SELECT DISTINCT rr.routine_id, rr.linked_issue_id AS issue_id
           FROM routine_runs rr
           WHERE rr.company_id = ${companyId}
             AND rr.linked_issue_id IS NOT NULL
+        ),
+        routine_issue_tree(routine_id, issue_id) AS (
+          SELECT fr.routine_id, fr.issue_id
+          FROM firing_root fr
+          JOIN issues i ON i.id = fr.issue_id
+          WHERE i.company_id = ${companyId}
+            AND i.hidden_at IS NULL
+            AND i.harness_kind IS NULL
           UNION
           SELECT t.routine_id, i.id
           FROM issues i
@@ -757,6 +806,11 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           WHERE i.company_id = ${companyId}
             AND i.hidden_at IS NULL
             AND i.harness_kind IS NULL
+            -- Stop at another routine's firing root: that subtree is its own
+            -- routine's cost, and claiming it here would double-count it.
+            AND NOT EXISTS (
+              SELECT 1 FROM firing_root fr WHERE fr.issue_id = i.id
+            )
         )
         SELECT
           r.id AS "routineId",
@@ -783,18 +837,17 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           ), 0)::double precision AS "subscriptionCostUsd"
         FROM routines r
         LEFT JOIN routine_issue_tree t ON t.routine_id = r.id
-        LEFT JOIN (
-          SELECT DISTINCT ON (id) id, issue_id, heartbeat_run_id, billing_type,
-                 cost_cents, input_tokens, cached_input_tokens, output_tokens, occurred_at
-          FROM cost_events
-          WHERE company_id = ${companyId}
-        ) ce ON ce.issue_id = t.issue_id ${rangeFilter}
+        LEFT JOIN cost_events ce
+          ON ce.issue_id = t.issue_id
+          AND ce.company_id = ${companyId}
+          ${rangeFilter}
         LEFT JOIN heartbeat_runs hr ON hr.id = ce.heartbeat_run_id
         LEFT JOIN agents a ON a.id = r.assignee_agent_id
         WHERE r.company_id = ${companyId}
         GROUP BY r.id, r.title, r.status, r.assignee_agent_id, a.name
-        ORDER BY "totalTokens" DESC
+        ORDER BY "totalTokens" DESC, r.id
         LIMIT ${limit}
+        OFFSET ${offset}
       `);
 
       const list = Array.isArray(rows) ? rows : ((rows as { rows?: unknown[] }).rows ?? []);

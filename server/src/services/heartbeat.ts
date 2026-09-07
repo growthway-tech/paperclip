@@ -4841,6 +4841,13 @@ function normalizeBilledCostCents(
  * totals a floor rather than a total. Admitting a reported `costUsd` gives
  * those runs an owner without inventing numbers for runs that truly reported
  * nothing.
+ *
+ * The dollar figure has to be *positive* to count. Adapters such as pi-local
+ * initialize the reported cost to 0, so accepting a mere non-null would write an
+ * all-zero row for a run that returned before collecting any usage. That row
+ * carries no information and actively misleads: it moves the run out of
+ * `summary.lostRunCount` into the accounted set, hiding the exact blind spot
+ * these endpoints exist to expose.
  */
 export function shouldRecordLedgerEvent(input: {
   billedCostCents: number;
@@ -4850,7 +4857,11 @@ export function shouldRecordLedgerEvent(input: {
   outputTokens: number;
 }): boolean {
   const hasTokenUsage = input.inputTokens > 0 || input.cachedInputTokens > 0 || input.outputTokens > 0;
-  return input.billedCostCents > 0 || hasTokenUsage || input.billedCostUsd != null;
+  const hasReportedSpend =
+    typeof input.billedCostUsd === "number" &&
+    Number.isFinite(input.billedCostUsd) &&
+    input.billedCostUsd > 0;
+  return input.billedCostCents > 0 || hasTokenUsage || hasReportedSpend;
 }
 
 export function resolveLedgerCostStatus(input: {

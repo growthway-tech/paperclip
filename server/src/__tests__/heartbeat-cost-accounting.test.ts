@@ -111,4 +111,28 @@ describe("heartbeat cost accounting", () => {
       outputTokens: 0,
     })).toBe(false);
   });
+
+  // Adapters such as pi-local initialize the reported cost to 0, so a run that
+  // returns before collecting usage arrives here with an explicit zero rather
+  // than a null. Writing an all-zero row for it would move the run out of
+  // `summary.lostRunCount` and claim it was accounted for.
+  it("does not record a ledger event for an explicit zero-dollar run with no usage", () => {
+    expect(shouldRecordLedgerEvent({
+      billedCostCents: 0,
+      billedCostUsd: 0,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+    })).toBe(false);
+  });
+
+  it("does not record a ledger event for a non-finite reported cost", () => {
+    expect(shouldRecordLedgerEvent({
+      billedCostCents: 0,
+      billedCostUsd: Number.NaN,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+    })).toBe(false);
+  });
 });
