@@ -1163,6 +1163,60 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(summary.lostRunCount).toBe(0);
   });
 
+  // A `succeeded` status is not proof that the run accounted for itself. On the
+  // live company database (2026-09-08) 8 of 1.478 succeeded runs carry no
+  // `usage_json`: usage and `result_json` are written by one guarded update that
+  // is skipped when the run already left `running`, so both are missing on
+  // exactly the same rows. Classifying by status would file these as fine and
+  // hide real consumption, so the gap must key off `error_code` only.
+  it("counts a succeeded run that never persisted usage as lost consumption", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Cost Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "succeeded",
+      // The shape observed live: no error code to excuse it, and the whole
+      // finalization write (usage and result alike) never landed.
+      errorCode: null,
+      startedAt: new Date("2026-04-10T00:00:00.000Z"),
+      finishedAt: new Date("2026-04-10T00:05:00.000Z"),
+      usageJson: null,
+      resultJson: null,
+    });
+
+    const summary = await costService(db).summary(companyId, {
+      from: new Date("2026-04-01T00:00:00.000Z"),
+      to: new Date("2026-04-15T23:59:59.999Z"),
+    });
+
+    expect(summary.unmeteredRunCount).toBe(1);
+    expect(summary.lostRunCount).toBe(1);
+    // It must not be excused as "never reached the model" just for succeeding.
+    expect(summary.neverRanRunCount).toBe(0);
+  });
+
   it("reports usage measured on a run but never aggregated as stranded, not lost", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

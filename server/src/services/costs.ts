@@ -27,8 +27,17 @@ const SUBSCRIPTION_BILLING_TYPES = ["subscription_included", "subscription_overa
  * carried no `usage_json`. 237 of them matched these codes and showed no model
  * output — their logs are adapter error text (~2 KB), never a transcript. The
  * remaining 30 (`process_lost`, unpriced `adapter_failed`) had real transcripts
- * up to 188 KB and are the genuine accounting gap. Zero of 1.021 `succeeded`
- * runs are unpriced, which is why this split is safe: success always accounts.
+ * up to 188 KB and are the genuine accounting gap.
+ *
+ * The split keys off `error_code`, never off `status`, because a successful run
+ * is not a guarantee of accounting. Re-measured 2026-09-08 (2.378 runs): 8 of
+ * 1.478 `succeeded` runs carry no `usage_json`, so an earlier "success always
+ * accounts" reading of this rule was wrong. Those 8 share one shape — the whole
+ * finalization write is missing (`result_json` is null on exactly the same 8
+ * rows), because usage and result are persisted by a single guarded write that
+ * is skipped when the run already left `running`. They carry no
+ * `NO_MODEL_WORK_ERROR_CODES` code, so they land in `lost` and stay visible
+ * instead of being silently excused as never having run.
  */
 const NO_MODEL_WORK_ERROR_CODES = [
   "acpx_session_config_failed",
