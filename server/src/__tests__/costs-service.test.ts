@@ -1217,6 +1217,64 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(summary.neverRanRunCount).toBe(0);
   });
 
+  // `cancelled` is written by `cancelActiveForAgentInternal`, which terminates a
+  // child process that is already running, so the run can be cancelled mid-turn
+  // after the provider has billed the tokens. Live data (2026-09-08): of 28 such
+  // runs 15 recorded `process_started_at` and 26 emitted output (median
+  // `last_output_seq` 120, max 645, versus max 4 for the pre-dispatch
+  // `acpx_session_*` codes), and one `cancelled` run carries `usage_json` with
+  // 4.57M tokens. Excusing the code as "never reached the model" therefore
+  // deleted real consumption from the declared gap.
+  it("counts a cancelled run that was killed mid-turn as lost consumption", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Cost Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "cancelled",
+      errorCode: "cancelled",
+      // The live shape: the child process was up and streaming when the cancel
+      // landed, which is exactly why the tokens were already spent.
+      startedAt: new Date("2026-04-10T00:00:00.000Z"),
+      processStartedAt: new Date("2026-04-10T00:00:04.000Z"),
+      finishedAt: new Date("2026-04-10T00:05:34.000Z"),
+      lastOutputAt: new Date("2026-04-10T00:05:30.000Z"),
+      lastOutputSeq: 405,
+      usageJson: null,
+    });
+
+    const summary = await costService(db).summary(companyId, {
+      from: new Date("2026-04-01T00:00:00.000Z"),
+      to: new Date("2026-04-15T23:59:59.999Z"),
+    });
+
+    expect(summary.unmeteredRunCount).toBe(1);
+    expect(summary.lostRunCount).toBe(1);
+    // Being cancelled is not evidence that no prompt reached the model.
+    expect(summary.neverRanRunCount).toBe(0);
+  });
+
   it("reports usage measured on a run but never aggregated as stranded, not lost", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

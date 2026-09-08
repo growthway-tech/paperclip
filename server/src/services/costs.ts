@@ -38,12 +38,24 @@ const SUBSCRIPTION_BILLING_TYPES = ["subscription_included", "subscription_overa
  * is skipped when the run already left `running`. They carry no
  * `NO_MODEL_WORK_ERROR_CODES` code, so they land in `lost` and stay visible
  * instead of being silently excused as never having run.
+ *
+ * Membership test: a code belongs here only when the path that writes it runs
+ * *before* the adapter is dispatched. That is what makes "consumed nothing" a
+ * property of the code rather than a guess. `cancelled` failed that test and
+ * was removed on 2026-09-08: `cancelActiveForAgentInternal` writes it while
+ * terminating an already-running child process, so the run can be mid-turn.
+ * The live data agrees — of 28 such runs, 15 recorded `process_started_at`, 26
+ * emitted output (median `last_output_seq` 120, max 645, against a max of 4 for
+ * the pre-dispatch `acpx_session_*` codes whose logs are adapter error text),
+ * and one `cancelled` run does carry `usage_json` with 4.57M tokens, proving
+ * the state is reachable after the model has been billed. Excusing them cost
+ * 26 runs of real consumption from `lostRunCount`; keeping them costs 2 runs
+ * that emitted nothing, which overstates a declared gap instead of hiding one.
  */
 const NO_MODEL_WORK_ERROR_CODES = [
   "acpx_session_config_failed",
   "acpx_session_init_failed",
   "configuration_incomplete",
-  "cancelled",
   "issue_terminal_status",
   "issue_reassigned",
   "issue_assignee_changed",
