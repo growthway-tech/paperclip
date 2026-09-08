@@ -130,7 +130,13 @@ async function countRunsWithoutCostEvents(db: Db, companyId: string, range?: Cos
     // Only finalized runs can be missing a cost event. A run gets `startedAt`
     // when it is claimed but writes its cost event at finalization, so counting
     // by start time reports every run currently in flight as lost consumption.
-    isNotNull(heartbeatRuns.finishedAt),
+    //
+    // Written as raw SQL rather than `isNotNull` on purpose: the in-flight PR
+    // that fixes `by-project` double counting drops the last other use of that
+    // helper and removes it from the shared `drizzle-orm` import. Git merges the
+    // two changes without a conflict because neither edits the other's lines, so
+    // depending on the binding here would break the build only after both land.
+    sql`${heartbeatRuns.finishedAt} is not null`,
     sql`not exists (
       select 1 from ${costEvents}
       where ${costEvents.heartbeatRunId} = ${heartbeatRuns.id}
@@ -691,9 +697,13 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       limit = 20,
       offset = 0,
     ) => {
+      // Raw SQL instead of `isNotNull` for the same reason as in
+      // `countRunsWithoutCostEvents`: the concurrent `by-project` fix removes
+      // that helper from this file's import list, and the two changes merge
+      // without a textual conflict.
       const conditions: ReturnType<typeof eq>[] = [
         eq(costEvents.companyId, companyId),
-        isNotNull(costEvents.issueId),
+        sql`${costEvents.issueId} is not null` as ReturnType<typeof eq>,
       ];
       if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
       if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
